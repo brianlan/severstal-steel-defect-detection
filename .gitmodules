@@ -1,0 +1,3 @@
+[submodule "src/lanutils"]
+	path = src/lanutils
+	url = git@github.com:brianlan/lanutils.git
