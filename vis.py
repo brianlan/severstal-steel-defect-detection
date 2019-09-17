@@ -19,6 +19,7 @@ parser.add_argument("--dataset-dir", type=Path, required=True)
 parser.add_argument("--output-dir", type=Path, required=True)
 parser.add_argument("--label-path", type=Path, required=True)
 parser.add_argument("--indices", type=Path)
+parser.add_argument("--save-results-to-separate-class-folder", action="store_true", default=False)
 parser.add_argument("--num-processes", type=int, default=0)
 args = parser.parse_args()
 
@@ -48,7 +49,19 @@ def visualize(file_index):
         contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         for cntr in contours:
             im = cv2.polylines(im, cntr.transpose(1, 0, 2), True, colors[cls - 1])
-    cv2.imwrite(str(args.output_dir / fname), im)
+
+    if args.save_results_to_separate_class_folder:
+        for cls in label[fname].keys():
+            cv2.imwrite(str(args.output_dir / str(cls) / fname), im)
+    else:
+        cv2.imwrite(str(args.output_dir / fname), im)
+
+
+def create_output_dirs():
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_results_to_separate_class_folder:
+        for cls in range(1, 5):
+            (args.output_dir / str(cls)).mkdir(parents=True, exist_ok=True)
 
 
 if __name__ == "__main__":
@@ -59,9 +72,10 @@ if __name__ == "__main__":
     label = read_label(args.label_path)
     encoder = RunLengthEncoder()
     colors = get_colors(4)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    create_output_dirs()
     if args.num_processes == 0:
         for fidx in tqdm(indices):
             visualize(fidx)
-    with multiprocessing.Pool(processes=args.num_processes) as pool:
-        _ = list(tqdm(pool.imap_unordered(visualize, indices), total=len(indices)))
+    else:
+        with multiprocessing.Pool(processes=args.num_processes) as pool:
+            _ = list(tqdm(pool.imap_unordered(visualize, indices), total=len(indices)))
