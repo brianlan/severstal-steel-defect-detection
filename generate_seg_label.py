@@ -39,7 +39,7 @@ def generate_seg_label(fname, im_size=(1600, 256)):
     for cls, encoded_seq in label[fname].items():
         mask[:, :, cls - 1] = encoder.decode(encoded_seq, im_size)
     # cv2.imwrite(str((args.output_dir / fname).with_suffix(".png")), mask)
-    np.save(str((args.output_dir / fname).with_suffix(".npy")), mask)
+    np.savez_compressed(str((args.output_dir / fname).with_suffix("")), mask=mask.transpose(2, 0, 1))
 
 
 if __name__ == "__main__":
