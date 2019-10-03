@@ -11,7 +11,9 @@ from __future__ import print_function
 import os
 import logging
 from pathlib import Path
+import datetime
 
+import attr
 import cv2
 import torch
 import torch.nn as nn
@@ -37,6 +39,47 @@ def get_colors(n_desired_colors, cmap_name="rainbow"):
         colors = cmap(np.linspace(0, 1, n_desired_colors))
     colors = (colors[:, :3] * 255).astype(np.int32)
     return colors
+
+
+@attr.s
+class RunLengthEncoder:
+    direction = attr.ib(default="downward_then_rightward")
+
+    @direction.validator
+    def direction_validator(self, attribute, value):
+        assert value in ["downward_then_rightward", "rightward_then_downward"]
+
+    def encode(self, mask):
+        """
+        :param mask: 2-dimensional ndarray with unique values 0 and 1.
+        :return: encoded sequence, the very first pixel (mask[0, 0]) idx is encoded as 1.
+        """
+        assert mask.ndim == 2
+        assert set(np.unique(mask).tolist()).issubset({0, 1})
+        mask_flatten = (mask if self.direction == "rightward_then_downward" else mask.T).flatten()
+        padded = np.insert(np.insert(mask_flatten, len(mask_flatten), 0), 0, 0)  # pad 0 at the beginning and the end.
+        pix_grp_key_pos, = np.where(padded[1:] != padded[:-1])
+        grp_start_pos = pix_grp_key_pos[::2] + 1
+        npix_in_grp = pix_grp_key_pos[1::2] - pix_grp_key_pos[::2]
+        encoded = np.vstack((grp_start_pos, npix_in_grp)).transpose().flatten().tolist()
+        return encoded
+
+    def decode(self, encoded_sequence, target_size):
+        """
+        :param encoded_sequence: the very first pixel (mask[0, 0]) idx is encoded as 1.
+        :param target_size: tuple (width, height)
+        :return: 2d ndarray with unique values 0 and 1.
+        """
+        assert len(target_size) == 2
+        pix_pos = np.concatenate(([
+            range(st_pos, st_pos + npix) for st_pos, npix in zip(encoded_sequence[::2], encoded_sequence[1::2])
+        ]))
+        operating_size = target_size if self.direction == "rightward_then_downward" else target_size[::-1]
+        mask = np.zeros(operating_size[::-1], dtype=np.uint8)
+        row_idx = (pix_pos - 1) // operating_size[0]  # minus 1 due to encoded_sequence is starting with 1.
+        col_idx = (pix_pos - 1) % operating_size[0]
+        mask[row_idx, col_idx] = 1
+        return mask if self.direction == "rightward_then_downward" else mask.T
 
 
 #########################################
@@ -625,21 +668,44 @@ class HRSegNet(nn.Module):
 
 
 def vis_seg_results(seg_scores, im_path):
-    _im = cv2.imread(im_path)
+    _im = cv2.imread(str(im_path))
     for _msk, _clr in zip(seg_scores, colors):
         colored_msk = (np.repeat(_msk[..., None], 3, axis=2) * _clr).astype(np.uint8)
         resized_colored_msk = cv2.resize(colored_msk, _im.shape[:2][::-1], interpolation=cv2.INTER_AREA)
         _im = cv2.addWeighted(_im, 1, resized_colored_msk, 0.5, 0)
-    save_path = vis_dir / Path(im_path).relative_to(test_image_dir)
+    save_path = vis_dir / im_path.relative_to(test_image_dir)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(save_path), _im)
 
 
+def now():
+    return datetime.datetime.now()
+
+
+def show_progress(cur_iter, tot):
+    pct10 = tot // 10
+    if (cur_iter + 1) % pct10 == 0:
+        print(f"CurrentProgress: {(cur_iter + 1)/tot*100:.1f}% ({cur_iter}/{tot}) [{now()}]")
+
+
+def get_encoded_seg_results(encoder, seg_scores):
+    return [encoder.encode(msk) for msk in seg_scores]
+
+
+def write_seg_results_to_submission_file(results, path):
+    with open(path, 'w') as f:
+        f.write("ImageId_ClassId,EncodedPixels\n")
+        for fn, codes in results.items():
+            for i, code in enumerate(codes):
+                f.write(f"{fn}_{i+1},{' '.join([str(c) for c in code])}\n")
+
+
 # test_image_dir = "/kaggle/input/severstal-steel-defect-detection/test_images"
 test_image_dir = "/data2/datasets/kaggle/severstal-steel-defect-detection/raw/test"
-model_path = "/home/rlan/deploy/pytorch-detection/checkpoints/severstal/w18smallv2_bs14_alltransform#SeverstalSteelDefectDetection#HRSegNet#0.01#200#best.pth"
+model_path = "/home/rlan/projects/pytorch-detection/checkpoints/severstal/w18smallv2_bs14_bce_cls3w0.2#SeverstalSteelDefectDetection#HRSegNet#0.01#9-49-70#best.pth"
 vis_dir = Path('/tmp/vis-eval')
 colors = get_colors(4, cmap_name="tab10")
+encoder = RunLengthEncoder()
 transforms = [
     ZeroBlackMargin(black_thresh=30),
     Div(by=255.0),
@@ -647,13 +713,24 @@ transforms = [
     ToTensor(),
 ]
 dataset = SeverstalSteelDefectDetection(test_image_dir, transforms=transforms)
+total = len(dataset)
 dataloader = DataLoader(dataset)
 model = HRSegNet()
 model.load_state_dict(torch.load(model_path)['integrated_model'])
 model.cuda()
 
-for im_paths, im in tqdm(dataloader):
+results = {}
+seg_class_distribution = np.zeros(4)
+for i, (im_paths, im) in enumerate(dataloader):
     with torch.no_grad():
+        _im_path = Path(im_paths[0])
         seg_logits = model(im.cuda())
         seg_scores = (seg_logits > 0).cpu().numpy()[0]
-        vis_seg_results(seg_scores, im_paths[0])
+        seg_class_distribution += (seg_scores.sum(1).sum(1) > 0).astype(np.int32)
+
+    vis_seg_results(seg_scores, _im_path)
+    results[_im_path.name] = get_encoded_seg_results(encoder, seg_scores)
+    show_progress(i, total)
+
+print(seg_class_distribution)
+write_seg_results_to_submission_file(results, "submission.csv")
